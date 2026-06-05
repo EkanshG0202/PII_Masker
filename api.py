@@ -1,7 +1,9 @@
 """
 Indian PII Masker — REST API
 ============================
-Wraps indian_pii_masker.py in a FastAPI application.
+Wraps the Two-Pass PII Masking Pipeline in a FastAPI application.
+Pass 1: Strict Regex (indian_pii_masker.py)
+Pass 2: Contextual NLP (indian_gliner_pii_masker.py)
 
 Endpoints
 ─────────
@@ -11,7 +13,7 @@ Endpoints
 
 Setup
 ─────
-    pip install fastapi uvicorn psutil
+    pip install fastapi uvicorn psutil gliner presidio-analyzer presidio-anonymizer
 
 Run
 ───
@@ -28,11 +30,13 @@ import time
 
 import psutil
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
+# Import Pass 1 (Strict IDs) and the utility monitor
 from indian_pii_masker import mask_pii, ResourceMonitor
+# Import Pass 2 (Contextual NLP)
+from indian_pii_text_masker import mask_text_entities
 
 
 # =========================================================
@@ -41,11 +45,34 @@ from indian_pii_masker import mask_pii, ResourceMonitor
 
 app = FastAPI(
     title="Indian PII Masker",
-    description="Detects and masks Indian PII (Aadhaar, PAN, GST, IFSC, Phone, Email, and more).",
-    version="1.0.0",
+    description="Detects and masks Indian PII using a Two-Pass Pipeline (Regex -> GLiNER).",
+    version="2.0.0",
 )
 
 _proc = psutil.Process(os.getpid())
+
+
+# =========================================================
+# MIDDLEWARE
+# =========================================================
+
+@app.middleware("http")
+async def log_response_time(request: Request, call_next):
+    """
+    Middleware to calculate and print the total response time for every request.
+    Also injects the timing into the response headers.
+    """
+    start_time = time.perf_counter()
+    
+    response = await call_next(request)
+    
+    process_time = time.perf_counter() - start_time
+    print(f"[{request.method}] {request.url.path} - Total Response Time: {process_time:.4f} seconds")
+    
+    # Optional: Attach the process time to the response headers
+    response.headers["X-Process-Time"] = str(process_time)
+    
+    return response
 
 
 # =========================================================
@@ -93,21 +120,24 @@ _start_time = time.perf_counter()
 @app.post(
     "/mask",
     response_model=MaskResponse,
-    summary="Mask PII in a single text",
+    summary="Mask PII in a single text using a two-pass pipeline",
 )
 def mask_single(req: MaskRequest) -> MaskResponse:
     """
-    Accepts a text string and returns it with all detected Indian PII
-    replaced by labelled placeholders (e.g. `[PAN]`, `[AADHAAR]`).
+    Executes a Two-Pass Redaction:
+    1. Evaluates strict structured IDs via regex.
+    2. Passes the redacted string to GLiNER to capture context-heavy names and addresses.
     """
     if not req.text.strip():
         raise HTTPException(status_code=422, detail="'text' must not be empty.")
 
-    with ResourceMonitor("mask_pii", print_report=False) as mon:
-        masked = mask_pii(req.text)
+    # Wrap the entire two-step process in one monitor block to get cumulative latency/CPU metrics
+    with ResourceMonitor("two_pass_masking", print_report=False) as mon:
+        step1_masked = mask_pii(req.text, monitor=False)
+        final_masked = mask_text_entities(step1_masked, monitor=False)
 
     return MaskResponse(
-        masked_text=masked,
+        masked_text=final_masked,
         resources=mon.stats if req.monitor else None,
     )
 
@@ -120,17 +150,19 @@ def mask_single(req: MaskRequest) -> MaskResponse:
 def mask_batch(req: BatchMaskRequest) -> BatchMaskResponse:
     """
     Accepts a list of text strings and returns each one masked.
-    Useful for processing records from a CSV or database in one call.
+    Routes each string through both the strict ID and NLP masking modules.
     """
     if not req.texts:
         raise HTTPException(status_code=422, detail="'texts' list must not be empty.")
 
     results = []
     for text in req.texts:
-        with ResourceMonitor("mask_pii", print_report=False) as mon:
-            masked = mask_pii(text)
+        with ResourceMonitor("two_pass_batch_item", print_report=False) as mon:
+            step1_masked = mask_pii(text, monitor=False)
+            final_masked = mask_text_entities(step1_masked, monitor=False)
+            
         results.append(MaskResponse(
-            masked_text=masked,
+            masked_text=final_masked,
             resources=mon.stats if req.monitor else None,
         ))
 
