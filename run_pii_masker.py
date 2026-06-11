@@ -63,7 +63,7 @@ def call_batch_api(texts: list[str], base_url: str) -> list[str]:
 
     print(f"  Sending {len(texts)} queries to {url} ...")
     try:
-        resp = requests.post(url, json=payload, timeout=120)
+        resp = requests.post(url, json=payload, timeout=400)
         resp.raise_for_status()
     except requests.exceptions.ConnectionError:
         print(f"\n[ERROR] Could not connect to {url}")
