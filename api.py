@@ -134,7 +134,7 @@ def mask_single(req: MaskRequest) -> MaskResponse:
     # Wrap the entire two-step process in one monitor block to get cumulative latency/CPU metrics
     with ResourceMonitor("two_pass_masking", print_report=False) as mon:
         step1_masked = mask_pii(req.text, monitor=False)
-        final_masked = mask_text_entities(step1_masked, monitor=False)
+        final_masked = mask_text_entities(step1_masked)
 
     return MaskResponse(
         masked_text=final_masked,
@@ -159,7 +159,7 @@ def mask_batch(req: BatchMaskRequest) -> BatchMaskResponse:
     for text in req.texts:
         with ResourceMonitor("two_pass_batch_item", print_report=False) as mon:
             step1_masked = mask_pii(text, monitor=False)
-            final_masked = mask_text_entities(step1_masked, monitor=False)
+            final_masked = mask_text_entities(step1_masked)
             
         results.append(MaskResponse(
             masked_text=final_masked,

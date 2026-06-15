@@ -1,0 +1,10 @@
+gliner_pii_finetuned/
+gliner-pii-model/
+
+__pycache__/
+*.pyc
+
+.vscode/
+
+masked_output.csv
+masked_output.txt

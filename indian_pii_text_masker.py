@@ -1,44 +1,20 @@
 """
-Indian Text PII Masker (GLiNER + IndicNER + Presidio)
-=====================================================
-Extracts and masks unstructured text-based entities using a hybrid
-approach of GLiNER and IndicNER integrated into Microsoft Presidio.
+Indian Text PII Masker (GLiNER + Presidio)
+==========================================
+Extracts and masks unstructured text-based entities using
+GLiNER integrated into Microsoft Presidio.
 
 Entities masked:
-  PERSON        Person names (IndicNER for semantic, GLiNER for context)
+  PERSON        Person names
   ORGANIZATION  Company/org names
-  ADDRESS       Postal addresses and landmarks (GLiNER)
-  LOCATION      Geographical locations, cities, states
+  ADDRESS       Postal addresses and landmarks
 """
 
 import re
-import os
-import time
-import uuid
-import psutil
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 
 import torch
 
-# =========================================================
-# SECURITY GUARD: PyTorch Version Enforcement
-# =========================================================
-# PyTorch versions < 2.6 contain a severe arbitrary code execution
-# vulnerability in torch.load() via pickle. We strictly enforce 2.6+.
-_torch_v = torch.__version__.split('+')[0].split('.')
-if int(_torch_v[0]) < 2 or (int(_torch_v[0]) == 2 and int(_torch_v[1]) < 6):
-    raise SystemExit(
-        f"🚨 SECURITY HALT: Current PyTorch version is {torch.__version__}.\n"
-        f"Due to arbitrary code execution risks in `torch.load()`, you MUST upgrade to PyTorch 2.6.0 or higher.\n"
-        f"Please run: pip install --upgrade torch"
-    )
-
-from transformers import pipeline
-from huggingface_hub import login
-
-# 1. Force the authentication at the environment level
-my_token = "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" # <-- PASTE YOUR REAL TOKEN HERE
-login(token=my_token)
 from presidio_analyzer import AnalyzerEngine, RecognizerResult, EntityRecognizer
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
@@ -46,385 +22,237 @@ from gliner import GLiNER
 
 
 # =========================================================
-# SENTINEL HELPER
+# STRUCTURED IDENTIFIER PROTECTION
 # =========================================================
+# These patterns are replaced with sentinels BEFORE GLiNER runs,
+# then restored verbatim AFTER masking.
 
-def _sentinel(tag: str) -> str:
-    """Generate a unique placeholder that won't appear in real text."""
-    return f"__PII_{tag}_{uuid.uuid4().hex[:10]}__"
+_PROTECT_PATTERNS = [
+    # AADHAAR — 12 digits in 4-4-4 groups (space, hyphen, or none)
+    r"(?<!\d)\d{4}[\s\-]?\d{4}[\s\-]?\d{4}(?!\d)",
+    # PAN — AAAAA9999A
+    r"(?<![A-Z0-9])[A-Z]{5}\d{4}[A-Z](?![A-Z0-9])",
+    # GST — 29ABCDE1234F1Z5
+    r"\b\d{2}[A-Z]{5}\d{4}[A-Z]\d[Z][A-Z0-9]\b",
+    # IFSC — 4 letters + 0 + 6 alphanumeric
+    r"\b[A-Z]{4}0[A-Z0-9]{6}\b",
+    # PHONE — Indian mobile numbers
+    r"(?<!\d)(?:\+91[\s\-]?|91[\s\-]?|0)?[6-9]\d{4}[\s\-]?\d{5}(?!\d)",
+    # ACCOUNT — context-anchored bank account
+    r"(?<=account[\s:])\s*\d{11,18}(?!\d)",
+    # VOTER_ID — 3 letters + 7 digits
+    r"(?<![A-Z0-9])[A-Z]{3}\d{7}(?![A-Z0-9])",
+    # PASSPORT — 1 letter + 7 digits
+    r"(?<![A-Z0-9])[A-Z]\d{7}(?![A-Z0-9])",
+    # DRIVING LICENCE — SS-RR-YYYY-NNNNNNN
+    r"\b[A-Z]{2}[- ]\d{2}[- ]\d{4}[- ]\d{7}\b",
+    # UDYAM number
+    r"\b(?:UDYAM|UDAYM|UDHYAM)[- ][A-Z]{2}[- ]\d{2}[- ]\d{7}(?:/[A-Z]/\d{5})?",
+    # UAM/URC numbers (alphanumeric codes like BR26D0018623, KR01A0000045)
+    r"\b[A-Z]{2}\d{2}[A-Z]\d{7}\b",
+    # UAN — context-anchored 12 digits
+    r"(?<=uan[\s:])\s*\d{12}(?!\d)",
+    # EMAIL
+    r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
+    # URLs
+    r"https?://\S+",
+    # ── Non-PII keywords GLiNER commonly mislabels as PERSON/ORG ──
+    # Aadhaar/aadhar word variants
+    r"\b(?:aadhaar|aadhar|adhar|addhar|e-aasdhr)"
+    r"(?:\s+(?:number|no\.?|card|link|update|correction|enrollment|enrolment|seeding|linked|registered|validation|verified))?\b",
+    # Udyam / Udyog / Udhyog keyword phrases
+    r"\b(?:"
+    r"udyam|udhyam|udaym|udayam"
+    r"|udyam\s+registration|udhyam\s+registration|udaym\s+registration"
+    r"|udyam\s+portal|udyam\s+number|udyam\s+no|udyam\s+certificate"
+    r"|udyam\s+assist(?:\s+platform)?"
+    r"|ud(?:y|h?y)og\s+a[ad]ha?ar"
+    r"|ud(?:y|h?y)og\s+a[ad]ha?ar\s+(?:number|no\.?|registration|portal|certificate|memorandum|uam)"
+    r"|udhyog\s+aadhaar\s+memorandum|udyog\s+aadhar\s+memorandum"
+    r"|uam|urc"
+    r")\b",
+    # Registration / email / OTP / action words
+    r"\b(?:registration|registartion|registrations)\b",
+    r"\b(?:email|e-mail|email\s+id|mail\s+id)\b",
+    r"\b(?:otp|otp\s+number)\b",
+    r"\b(?:cancell?(?:ation)?|cancel(?:l?ed)?)\b",
+    r"\b(?:solve|solved|solution|resolve|resolved)\b",
+    r"\b(?:alr?ea?dy|alrady)\b",
+    r"\b(?:unable|trying|clicking|applying|attempting|writing|didt)\b",
+    r"\b(?:sir|madam|mam|dear\s+sir|dear\s+madam|dear\s+sir\s*/\s*madam)\b",
+    r"\b(?:proprietor|sole\s+proprietor|respondent|applicant|complainant)\b",
+    r"\b(?:application\s+)?dt\.?\b",
+    r"\b(?:latitude|longitude|geolocation|geo\s*tag(?:ging)?)\b",
+    r"\b(?:letter\s*head|letterhead)\b",
+    r"\b(?:msme|msefc|msmed|pmegp|kvic|sidbi|nsic|cgtmse)\b",
+]
 
-
-# =========================================================
-# WHITELISTS — terms that must NEVER be masked
-# =========================================================
-
-_GOV_SCHEMES = {
-    "msme", "msme portal", "udyam", "udyam portal", "udyam registration",
-    "udyog aadhaar", "udyog aadhar", "uam", "urc",
-    "udyam aadhar", "udyam aadhaar",
-    "udyam aadhar portal", "udyam aadhaar portal",
-    "udaym aadhar", "udaym aadhaar",
-    "udhyam aadhar", "udhyam aadhaar",
-    "udyam assist", "udyam assist platform",
-    "udyam number", "udyam no",
-    "udhyam number", "udhyam no",
-    "udyam registration number", "udyam registration no",
-    "pm vishwakarma", "pm vishvkarma",
-    "vishwakarma", "vishvkarma",
-    "vishwakarma yojana", "vishvkarma yojna", "vishvkarma yojana",
-    "vishwakarma scheme",
-    "pm vishwakarma yojana", "pm vishvkarma yojna",
-    "pradhan mantri kisan sampada yojana",
-    "startup india", "make in india", "jan dhan", "pmegp", "cgtmse",
-    "nsic", "kvic", "sidbi", "gem portal", "government e-marketplace",
-    "income tax portal", "gst portal", "mca portal", "epfo", "esic",
-    "district industries centre",
-    "the udyog aadhaar registration authority",
-    "udyog aadhaar registration authority",
-    "ax-momsme",
-}
-
-_GENERIC_ROLES = {
-    "sir", "madam", "mam", "dear sir", "dear madam", "respected sir",
-    "dear sir/madam", "dear sir / madam",
-    "sir/madam", "sir / madam", "sir/mam", "sir / mam",
-    "proprietor", "sole proprietor", "applicant",
-    "owner", "partner", "director", "manager", "officer", "authority",
-    "gram pradhan", "pradhan", "sarpanch", "panchayat", "officer in charge",
-    "registration authority",
-    "karta", "huf", "authorized signatory", "authorised signatory",
-    "nodal officer",
-    "letter head", "letterhead",
-    "spouse", "my spouse", "wife", "husband",
-    "persan", "persan name",
-    "tehsil",
-}
-
-_GENERIC_ACRONYMS = {
-    "otp", "sms", "email", "email id", "mail id", "mobile number",
-    "mobile no", "pan", "pan number", "pan no", "aadhaar", "aadhar",
-    "uan", "urc", "gstin", "gst", "ifsc", "neft", "rtgs",
-    "pdf", "otp number", "registration number", "application number",
-    "certificate", "udyam certificate", "udyam number",
-    "llp", "pvt", "ltd", "pvt ltd", "private limited",
-    "f.y.", "f.y", "fy",
-    "d.o.b", "d.o.b.", "dob",
-}
-
-KNOWN_TERMS: set = _GOV_SCHEMES | _GENERIC_ROLES | _GENERIC_ACRONYMS
-
-_SINGLE_TOKEN_BLACKLIST = {
-    "udyam", "udhyam", "udyog", "registration", "cancel", "cancell",
-    "solve", "mam", "latitude", "longitude", "i", "already", "forgot",
-    "alrady", "tehsil", "ho", "unable", "writing", "trying", "clicking",
-    "applying", "email", "otp", "us", "f.y.", "fy", "f.y", "alrady",
-    "cement business", "d.o.b", "dob", "llp", "udyog adhar", "udyog aadhar",
-}
-
-def _in_whitelist(text: str) -> bool:
-    norm = text.strip().lower()
-    if norm in KNOWN_TERMS or norm in _SINGLE_TOKEN_BLACKLIST:
-        return True
-    cleaned = re.sub(r"[^\w\s]", "", norm).strip()
-    if cleaned in KNOWN_TERMS or cleaned in _SINGLE_TOKEN_BLACKLIST:
-        return True
-    hyphenless = re.sub(r"[-]", " ", norm).strip()
-    for term in KNOWN_TERMS:
-        if (norm.startswith(term + " ")
-                or norm == term
-                or cleaned.startswith(term + " ")
-                or cleaned == term
-                or hyphenless.startswith(term + " ")):
-            return True
-    punct_stripped = norm.rstrip(".,;:!? ")
-    if punct_stripped in KNOWN_TERMS or punct_stripped in _SINGLE_TOKEN_BLACKLIST:
-        return True
-    return False
-
-
-# =========================================================
-# PERSON NAME PLAUSIBILITY GUARD
-# =========================================================
-
-_COMMON_NON_NAMES = {
-    "dear", "hello", "hi", "kindly", "please", "thank", "thanks",
-    "regards", "warm", "best", "yours", "truly", "sincerely",
-    "note", "subject", "reference", "re", "sub", "enclosure",
-    "attach", "attachment", "enclosed", "copy", "date", "place",
-    "from", "to", "cc", "bcc",
-    "bank", "loan", "business", "trade", "company", "firm", "enterprise",
-    "certificate", "registration", "scheme", "portal", "platform",
-    "application", "applicant", "account", "amount", "rupees", "inr",
-    "lakh", "crore", "total",
-    "udyam", "udhyam", "udyog", "udaym",
-    "i", "we", "our", "my",
-    "cancel", "cancell", "cancellation", "solve", "already", "forgot", "mam",
-    "alrady", "latitude", "longitude", "email", "otp",
-    "aadhaar", "aadhar", "adhar", "addhar",
-    "letter head", "letterhead",
-    "tehsil", "district", "nagar", "village", "taluka",
-    "spouse", "wife", "husband", "persan", "ho",
-    "update", "change", "reset", "verify", "register",
-    "download", "upload", "migrate", "retrieve",
-    "unable", "writing", "trying", "applying", "clicking", "attempting",
-    "running", "still",
-}
-
-_NON_NAME_PHRASES = {
-    "solve my problem", "solve my", "letter head",
-    "udyam aadhar", "udyam aadhaar", "udyam registration",
-    "udhyam registration", "udaym registration", "udyog aadhar",
-    "udyog aadhaar", "udyog adhar", "my spouse", "d.o.b.", "d.o.b",
-    "persan name", "cancel my", "cancell my", "please cancel",
-    "please cancell", "please solve", "please update", "please change",
-    "please register", "please verify", "please reset", "please retrieve",
-    "please download", "please upload", "please migrate", "unable to",
-    "not able to", "trying to", "writing to", "writing to request",
-    "applying to", "attempting to", "clicking on", "continuously trying",
-    "still not", "cancell", "cancel",
-}
-
-_NON_NAME_PHRASE_RE = re.compile(
-    r"\b(?:" + "|".join(re.escape(p) for p in sorted(_NON_NAME_PHRASES, key=len, reverse=True)) + r")\b",
+_PROTECT_RE = re.compile(
+    "|".join(f"(?:{p})" for p in _PROTECT_PATTERNS),
     re.IGNORECASE,
 )
 
-def _is_non_name_phrase(text: str) -> bool:
-    norm = text.strip().lower()
-    if norm in _NON_NAME_PHRASES:
-        return True
-    m = _NON_NAME_PHRASE_RE.fullmatch(norm)
-    return m is not None
+_SENTINEL_PREFIX = "__PROTECT_"
+_SENTINEL_SUFFIX = "__"
 
-_ALLOWED_LOWERCASE_PARTICLES = {"ji", "kumar", "devi", "bai", "lal", "ram"}
 
-_KNOWN_PLACE_NAMES = {
-    "maharashtra", "gujarat", "rajasthan", "karnataka", "kerala",
-    "tamilnadu", "tamil nadu", "andhra pradesh", "telangana", "odisha",
-    "west bengal", "uttar pradesh", "madhya pradesh", "bihar", "jharkhand",
-    "chhattisgarh", "uttarakhand", "himachal pradesh", "punjab", "haryana",
-    "delhi", "goa", "assam", "manipur", "meghalaya", "tripura", "nagaland",
-    "mizoram", "arunachal pradesh", "sikkim", "jammu", "kashmir",
-    "chandigarh", "puducherry", "pondicherry",
-    "mumbai", "pune", "nagpur", "nashik", "aurangabad",
-    "ahmedabad", "surat", "vadodara", "rajkot",
-    "jaipur", "jodhpur", "udaipur", "bikaner", "kota",
-    "bangalore", "bengaluru", "mysuru", "mysore", "hubli", "mangalore",
-    "hyderabad", "secunderabad", "warangal", "visakhapatnam", "vizag",
-    "ernakulam", "kochi", "cochin", "kozhikode", "calicut", "thiruvananthapuram",
-    "thrissur", "palakkad", "kollam", "kannur", "malappuram", "alappuzha",
-    "chennai", "madurai", "coimbatore", "salem", "trichy", "tiruchirappalli",
-    "kolkata", "howrah", "siliguri", "durgapur", "asansol",
-    "lucknow", "kanpur", "agra", "varanasi", "allahabad", "prayagraj",
-    "patna", "gaya", "bhagalpur",
-    "bhopal", "indore", "gwalior", "jabalpur",
-    "bhubaneswar", "cuttack", "rourkela",
-    "ranchi", "dhanbad", "jamshedpur",
-    "raipur", "bilaspur",
-    "dehradun", "haridwar", "roorkee",
-    "ludhiana", "amritsar", "jalandhar",
-    "gurgaon", "gurugram", "faridabad", "ambala",
-    "noida", "ghaziabad", "meerut", "bareilly", "moradabad",
-    "srinagar", "leh", "udhampur", "belgachia", "kishanganj",
+def _protect_identifiers(text: str) -> tuple[str, Dict[str, str]]:
+    restore_map: Dict[str, str] = {}
+    counter = [0]
+
+    def _repl(m):
+        key = f"{_SENTINEL_PREFIX}{counter[0]}{_SENTINEL_SUFFIX}"
+        restore_map[key] = m.group(0)
+        counter[0] += 1
+        return key
+
+    return _PROTECT_RE.sub(_repl, text), restore_map
+
+
+def _restore_identifiers(text: str, restore_map: Dict[str, str]) -> str:
+    for sentinel, original in restore_map.items():
+        text = text.replace(sentinel, original)
+    return text
+
+
+# =========================================================
+# PERSON SPAN VALIDATOR
+# =========================================================
+# Post-GLiNER guard: rejects PERSON predictions that are clearly not names.
+
+# Business/generic nouns that end up in 2-token "X Business" spans
+_BUSINESS_TAIL_WORDS = {
+    "business", "enterprise", "firm", "company", "shop", "store",
+    "agency", "bureau", "centre", "center", "services", "service",
+    "trading", "industries", "industry", "corporation", "associates",
+    "ventures", "venture", "works", "solutions", "consultancy",
+    "suppliers", "supplier", "dealers", "dealer", "products",
+    "exports", "imports", "logistics", "technologies", "tech",
+    "systems", "system", "group", "holding", "holdings",
 }
 
-def _is_plausible_name(text: str) -> bool:
-    stripped = text.strip()
-    norm = stripped.lower()
+# Single tokens that look superficially name-like but aren't
+_SINGLE_TOKEN_NON_NAMES = {
+    # Misspellings / typos / action words
+    "claear", "didt", "canu", "forgut", "alrady", "cancell",
+    "issie", "privde", "provied", "provied", "recev", "resev",
+    "resubmit", "migrate", "retrieve", "download", "upload",
+    # Document/portal words
+    "attachment", "letterhead", "certificate", "document", "letter",
+    "annexure", "enclosure", "affidavit", "invoice", "receipt",
+    "bharatmapservice", "webgis", "portal", "website",
+    # Commodities / generic nouns
+    "milk", "cement", "rice", "wheat", "cotton", "gold", "silver",
+    "iron", "steel", "wood", "cloth", "cloth",
+    # Roles already in protect list but belt-and-suspenders
+    "respondent", "petitioner", "complainant", "proprietor",
+    "applicant", "director", "manager", "owner", "partner",
+}
 
-    if _is_non_name_phrase(norm):
+# Name honorifics / prefixes — single-token spans with these are NOT names
+_HONORIFICS = {"mr", "mrs", "ms", "dr", "shri", "smt", "prof", "er"}
+
+# Name particles allowed as single lowercase tokens
+_NAME_PARTICLES = {"ji", "kumar", "devi", "bai", "lal", "ram", "singh",
+                   "devi", "ben", "bhai", "rao", "nair", "das"}
+
+
+def _is_valid_person_span(span_text: str) -> bool:
+    """Return False if the span is clearly not a person name."""
+    raw = span_text.strip()
+    if not raw:
         return False
 
-    cleaned = re.sub(r"[^\w\s]", "", norm).strip()
-    if (norm in KNOWN_TERMS or cleaned in KNOWN_TERMS
-            or norm in _SINGLE_TOKEN_BLACKLIST or cleaned in _SINGLE_TOKEN_BLACKLIST):
+    # Contains a sentinel — GLiNER tagged a protected token
+    if "__PROTECT_" in raw:
         return False
 
-    punct_stripped = norm.rstrip(".,;:!? ")
-    if punct_stripped in KNOWN_TERMS or punct_stripped in _SINGLE_TOKEN_BLACKLIST:
+    # Pure digits / punctuation
+    if re.fullmatch(r"[\d\s\.\-/,;:]+", raw):
         return False
 
-    if re.fullmatch(r"[\d\s]+", stripped):
+    # Strip trailing punctuation artifacts (e.g. "Rishi/s" → "Rishi")
+    cleaned = re.sub(r"[/\\.,;:!?\s]+$", "", raw).strip()
+    if not cleaned:
         return False
 
-    if re.search(r"\d", stripped) and len(stripped) <= 20:
-        return False
-
+    norm = cleaned.lower()
     tokens = norm.split()
+
+    # Single token checks
     if len(tokens) == 1:
         t = tokens[0]
-        if t in _COMMON_NON_NAMES:
+        # All-lowercase single token that's not a known particle
+        if raw == raw.lower() and t not in _NAME_PARTICLES:
             return False
-        if stripped.isupper() and t in _SINGLE_TOKEN_BLACKLIST:
+        # Known non-name single token
+        if t in _SINGLE_TOKEN_NON_NAMES:
             return False
-        if stripped == stripped.lower() and t not in _ALLOWED_LOWERCASE_PARTICLES:
+        # Honorific alone (no actual name)
+        if t.rstrip(".") in _HONORIFICS:
             return False
-        if "/" in stripped:
-            parts = [p.strip().lower() for p in stripped.split("/")]
-            if all(p in _COMMON_NON_NAMES or p in _GENERIC_ROLES for p in parts if p):
+        # All-uppercase token that's 6+ chars and contains no vowels
+        # (likely an acronym or garbled word, e.g. CLAEAR, DIDT)
+        if raw.isupper() and len(t) >= 4:
+            vowels = set("aeiou")
+            if not any(c in vowels for c in t):
                 return False
 
-    if len(stripped.strip()) <= 1:
+    # Multi-token: last token is a generic business noun → ORG, not NAME
+    if len(tokens) >= 2 and tokens[-1] in _BUSINESS_TAIL_WORDS:
+        return False
+
+    # Multi-token: ALL tokens are lowercase and none are name particles
+    if all(tok == tok.lower() for tok in tokens):
+        if not any(tok in _NAME_PARTICLES for tok in tokens):
+            return False
+
+    # Span is longer than 6 tokens — very unlikely to be a single person name
+    if len(tokens) > 6:
         return False
 
     return True
 
 
 # =========================================================
-# ROLE-SUFFIX TRIMMER
+# POST-MASK CLEANUP
 # =========================================================
 
-_ROLE_SUFFIX_RE = re.compile(
-    r"""
-    [,\s]* \b(
-        proprietor  | sole\s+proprietor |
-        owner       | co[- ]?owner      |
-        partner     | managing\s+partner |
-        director    | managing\s+director | executive\s+director |
-        manager     | general\s+manager  |
-        applicant   | complainant        |
-        founder     | co[- ]?founder     |
-        trustee     | secretary          |
-        chairman    | chairperson        |
-        karta       | authorised\s+signatory | authorized\s+signatory
-    )\b
-    [,\s]*$
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-def _trim_role_suffix(span_text: str, start: int, end: int):
-    m = _ROLE_SUFFIX_RE.search(span_text)
-    if not m:
-        return span_text, start, end
-    trimmed = span_text[: m.start()].rstrip(" ,")
-    if not trimmed:
-        return "", start, start
-    return trimmed, start, start + len(trimmed)
-
-
-# =========================================================
-# REGEX PRE-PASS
-# =========================================================
-
-_PROTECT_PATTERNS: List[Tuple[str, int]] = [
-    (
-        r"\b(?:UDYAM|UDAYM|UDHYAM)[- ][A-Z]{2}[- ]\d{2}[- ]\d{7}"
-        r"(?:/[A-Z]/\d{5})?",
-        re.IGNORECASE,
-    ),
-    (
-        r"(?<![A-Z0-9])[A-Z]{2}\d{2}[A-CE-Z]\d{7}(?!\w)",
-        re.IGNORECASE,
-    ),
-    (
-        r"\b(0?[1-9]|[12]\d|3[01])[/\-](0?[1-9]|1[0-2])[/\-](19|20)\d{2}\b",
-        0,
-    ),
-    (r"\b[A-Z]{4}0[A-Z0-9]{6}\b", re.IGNORECASE),
-    (r"\b\d{2}[A-Z]{5}\d{4}[A-Z]\d[Z][A-Z0-9]\b", re.IGNORECASE),
-    (r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b", 0),
-    (
-        r"\b[a-zA-Z0-9._%+\-]{2,}"
-        r"(?:gmail|yahoo|hotmail|outlook|rediffmail|ymail|live|icloud)"
-        r"(?:\.com)?\b",
-        re.IGNORECASE,
-    ),
-    (
-        r"(?<!\d)(?:\+91[\s\-]?|91[\s\-]?|0)?[6-9]\d{4}[\s\-]?\d{5}(?!\d)",
-        0,
-    ),
-    (r"(?<![_\d])\d{9,18}(?![_\d])", 0),
-]
-
-def _regex_protect(text: str) -> Tuple[str, Dict[str, str]]:
-    restore_map: Dict[str, str] = {}
-    for pattern, flags in _PROTECT_PATTERNS:
-        def _repl(m, _pattern=pattern):
-            s = _sentinel("PROTECT")
-            restore_map[s] = m.group(0)
-            return s
-        text = re.sub(pattern, _repl, text, flags=flags)
-    return text, restore_map
-
-
-# =========================================================
-# LOCATION / ADDRESS CONTEXT GUARD
-# =========================================================
-
-_LOCATION_CONTEXT_RE = re.compile(
-    r"\b(at|in|near|from|to|of|"
-    r"district|village|taluka|tehsil|city|state|"
-    r"pin|pincode|pin\s*code|ward|nagar|nagara|"
-    r"road|street|marg|lane|gali|colony|sector|phase|plot|block|flat|floor|"
-    r"house|h\.?no|door|building|bldg|tower|"
-    r"locality|area|zone|region|"
-    r"post|p\.?o\.?|po\b|thana|mandal|"
-    r"india|state|province|country)\b",
+_BROKEN_SENTINEL_RE = re.compile(
+    r"(?:\[)?__(?:PROTECT_\d+|\[(?:NAME|ORG|ADDRESS)\])__(?:\])?",
     re.IGNORECASE,
 )
+_DOUBLE_BRACKET_RE = re.compile(r"\[\[([A-Z]+)\]\]")
 
-_LOCATION_LABEL_WORDS = {
-    "tehsil", "district", "nagar", "nagara", "village", "taluka",
-    "ward", "sector", "phase", "plot", "block", "locality", "area",
-    "zone", "region", "thana", "mandal", "colony", "road", "street",
-    "lane", "marg", "gali", "state", "city", "country", "province",
-}
 
-_LOCATION_CONTEXT_WINDOW: int = 80
-
-def _has_location_context(text: str, start: int, end: int) -> bool:
-    snippet = text[max(0, start - _LOCATION_CONTEXT_WINDOW):
-                   end + _LOCATION_CONTEXT_WINDOW]
-    return bool(_LOCATION_CONTEXT_RE.search(snippet))
-
-def _has_name_token(tokens: List[str]) -> bool:
-    for t in tokens:
-        if not t:
-            continue
-        if t[0].isupper():
-            return True
-        if t.lower() in _ALLOWED_LOWERCASE_PARTICLES:
-            return True
-    return False
-
-def _dedup_results(results: List[RecognizerResult]) -> List[RecognizerResult]:
-    ranked = sorted(
-        results,
-        key=lambda r: (r.score, r.end - r.start),
-        reverse=True,
-    )
-    kept: List[RecognizerResult] = []
-    for r in ranked:
-        if not any(r.start < k.end and r.end > k.start for k in kept):
-            kept.append(r)
-    return kept
+def _cleanup_artefacts(text: str) -> str:
+    text = _BROKEN_SENTINEL_RE.sub("", text)
+    text = _DOUBLE_BRACKET_RE.sub(r"[\1]", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
 
 
 # =========================================================
-# RECOGNIZERS
+# GLINER RECOGNIZER
 # =========================================================
 
 _ENTITY_THRESHOLDS: Dict[str, float] = {
-    "PERSON":       0.85,
+    "PERSON":       0.75,
     "ORGANIZATION": 0.85,
-    "ADDRESS":      0.92,
-    "LOCATION":     0.90,
+    "ADDRESS":      0.80,
 }
 
-_ADDRESS_MIN_TOKENS: int = 4
+_ADDRESS_MIN_TOKENS: int = 2
+
 
 class GlinerRecognizer(EntityRecognizer):
-    def __init__(self, model_name: str = "urchade/gliner_medium-v2.1", threshold: float = 0.85):
-        self.label_mapping = {
-            "person name":              "PERSON",
-            "company name":             "ORGANIZATION",
-            "postal address":           "ADDRESS",
-            "geographical place name":  "LOCATION",
-        }
-        self.gliner_labels = list(self.label_mapping.keys())
-        self.threshold = threshold
+    FINETUNED_LABEL_MAPPING = {
+        "full_name":      "PERSON",
+        "company_name":   "ORGANIZATION",
+        "postal_address": "ADDRESS",
+    }
 
+    def __init__(self, finetuned_model_path: str = "./gliner_pii_finetuned"):
         if torch.cuda.is_available():
             device = "cuda"
         elif torch.backends.mps.is_available():
@@ -432,13 +260,13 @@ class GlinerRecognizer(EntityRecognizer):
         else:
             device = "cpu"
 
-        print(f"[text-masking] Loading GLiNER on {device.upper()}...")
-        # Explicitly request safetensors for security
-        self.model = GLiNER.from_pretrained(model_name).to(device)
+        print(f"[text-masking] Loading GLiNER from '{finetuned_model_path}' on {device.upper()} ...")
+        self.finetuned_model = GLiNER.from_pretrained(finetuned_model_path).to(device)
+        self.finetuned_labels = list(self.FINETUNED_LABEL_MAPPING.keys())
         print("[text-masking] GLiNER model loaded and ready.")
 
         super().__init__(
-            supported_entities=list(self.label_mapping.values()),
+            supported_entities=list(self.FINETUNED_LABEL_MAPPING.values()),
             name="GlinerRecognizer",
         )
 
@@ -448,336 +276,126 @@ class GlinerRecognizer(EntityRecognizer):
     def analyze(self, text: str, entities: List[str], nlp_artifacts=None) -> List[RecognizerResult]:
         results = []
         gliner_floor = min(_ENTITY_THRESHOLDS.values())
-        predictions = self.model.predict_entities(text, self.gliner_labels, threshold=gliner_floor)
 
-        for pred in predictions:
-            presidio_entity = self.label_mapping.get(pred["label"])
+        for pred in self.finetuned_model.predict_entities(
+            text, self.finetuned_labels, threshold=gliner_floor
+        ):
+            presidio_entity = self.FINETUNED_LABEL_MAPPING.get(pred["label"])
             if not presidio_entity or presidio_entity not in entities:
                 continue
-
-            entity_threshold = _ENTITY_THRESHOLDS.get(presidio_entity, self.threshold)
-            if pred["score"] < entity_threshold:
+            if pred["score"] < _ENTITY_THRESHOLDS[presidio_entity]:
                 continue
 
-            span_text = text[pred["start"]: pred["end"]]
+            span_text = pred["text"]
 
-            if _in_whitelist(span_text):
+            # Reject if span overlaps a sentinel
+            if "__PROTECT_" in span_text:
                 continue
 
-            if "__PII_" in span_text or re.fullmatch(r"[0-9a-f]{8,16}", span_text.strip(), re.IGNORECASE):
-                continue
-
-            pred_start, pred_end = pred["start"], pred["end"]
-
+            # Entity-specific validation
             if presidio_entity == "PERSON":
-                span_text, pred_start, pred_end = _trim_role_suffix(span_text, pred_start, pred_end)
-                if not span_text or not _is_plausible_name(span_text):
-                    continue
-                tokens = span_text.split()
-                if len(tokens) > 1 and not _has_name_token(tokens):
-                    continue
-                if span_text.strip().lower() in _KNOWN_PLACE_NAMES:
-                    continue
-
-            elif presidio_entity == "ORGANIZATION":
-                norm = span_text.strip().lower()
-                cleaned_norm = re.sub(r"[^\w\s]", "", norm)
-                if norm in _GOV_SCHEMES or cleaned_norm in _GOV_SCHEMES:
-                    continue
-                if norm in {"i", "we", "my", "d.o.b", "dob", "llp", "district industries centre", "udyog adhar", "udyog aadhar", "udyog aadhaar"}:
-                    continue
-                if norm.strip() in _SINGLE_TOKEN_BLACKLIST:
+                if not _is_valid_person_span(span_text):
                     continue
 
             elif presidio_entity == "ADDRESS":
                 if len(span_text.split()) < _ADDRESS_MIN_TOKENS:
                     continue
-                if not _has_location_context(text, pred_start, pred_end):
-                    continue
 
-            elif presidio_entity == "LOCATION":
-                norm = span_text.strip().lower()
-                if norm in {"us", "f.y.", "fy", "f.y", "i", "we", "alrady"}:
-                    continue
-                if re.match(r"^f\.?y\.?\s*\d{4}", norm) or re.match(r"^f\.?y\.?(\s*\d{2,4})?(\s*[-–]\s*\d{2,4})?$", norm):
-                    continue
-                if norm.strip() in _SINGLE_TOKEN_BLACKLIST or norm.strip() in _LOCATION_LABEL_WORDS:
-                    continue
-                if not _has_location_context(text, pred_start, pred_end):
-                    continue
-
-            results.append(
-                RecognizerResult(
-                    entity_type=presidio_entity,
-                    start=pred_start,
-                    end=pred_end,
-                    score=pred["score"],
-                )
-            )
+            results.append(RecognizerResult(
+                entity_type=presidio_entity,
+                start=pred["start"],
+                end=pred["end"],
+                score=pred["score"],
+            ))
 
         return _dedup_results(results)
 
 
-class IndicNerRecognizer(EntityRecognizer):
-    def __init__(self, model_name: str = "ai4bharat/IndicNER", threshold: float = 0.85):
-        self.label_mapping = {
-            "PER": "PERSON",
-            "ORG": "ORGANIZATION",
-            "LOC": "LOCATION",
-        }
-        self.threshold = threshold
-
-        if torch.cuda.is_available():
-            device = 0
-        elif torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = -1
-
-        print(f"[text-masking] Loading IndicNER on device {device}...")
-        
-        # Load normally. PyTorch 2.6+ handles the secure loading of the .bin file automatically.
-        self.nlp = pipeline(
-            "ner", 
-            model=model_name, 
-            aggregation_strategy="simple", 
-            device=device
-        )
-            
-        print("[text-masking] IndicNER model loaded and ready.")
-
-        super().__init__(
-            supported_entities=list(self.label_mapping.values()),
-            name="IndicNerRecognizer",
-        )
-
-    def load(self):
-        pass
-
-    def analyze(self, text: str, entities: List[str], nlp_artifacts=None) -> List[RecognizerResult]:
-        results = []
-        predictions = self.nlp(text)
-
-        for pred in predictions:
-            mapped_entity = self.label_mapping.get(pred.get("entity_group"))
-            
-            if not mapped_entity or mapped_entity not in entities:
-                continue
-
-            if pred["score"] < self.threshold:
-                continue
-
-            span_text = pred["word"]
-            pred_start = pred["start"]
-            pred_end = pred["end"]
-
-            if _in_whitelist(span_text):
-                continue
-            if "__PII_" in span_text or re.fullmatch(r"[0-9a-f]{8,16}", span_text.strip(), re.IGNORECASE):
-                continue
-
-            if mapped_entity == "PERSON":
-                span_text, pred_start, pred_end = _trim_role_suffix(span_text, pred_start, pred_end)
-                if not span_text or not _is_plausible_name(span_text):
-                    continue
-                tokens = span_text.split()
-                if len(tokens) > 1 and not _has_name_token(tokens):
-                    continue
-                if span_text.strip().lower() in _KNOWN_PLACE_NAMES:
-                    continue
-
-            elif mapped_entity == "ORGANIZATION":
-                norm = span_text.strip().lower()
-                cleaned_norm = re.sub(r"[^\w\s]", "", norm)
-                if norm in _GOV_SCHEMES or cleaned_norm in _GOV_SCHEMES:
-                    continue
-                if norm.strip() in _SINGLE_TOKEN_BLACKLIST:
-                    continue
-
-            elif mapped_entity == "LOCATION":
-                norm = span_text.strip().lower()
-                if norm in {"us", "f.y.", "fy", "f.y", "i", "we", "alrady"} or norm.strip() in _SINGLE_TOKEN_BLACKLIST:
-                    continue
-                if norm.strip() in _LOCATION_LABEL_WORDS:
-                    continue
-
-            results.append(
-                RecognizerResult(
-                    entity_type=mapped_entity,
-                    start=pred_start,
-                    end=pred_end,
-                    score=float(pred["score"]),
-                )
-            )
-
-        return _dedup_results(results)
+def _dedup_results(results: List[RecognizerResult]) -> List[RecognizerResult]:
+    ranked = sorted(results, key=lambda r: (r.score, r.end - r.start), reverse=True)
+    kept: List[RecognizerResult] = []
+    for r in ranked:
+        if not any(r.start < k.end and r.end > k.start for k in kept):
+            kept.append(r)
+    return kept
 
 
 # =========================================================
 # ENGINE SETUP
 # =========================================================
 
-def _build_analyzer() -> AnalyzerEngine:
-    engine = AnalyzerEngine()
-    engine.registry.add_recognizer(GlinerRecognizer(
-        model_name="urchade/gliner_medium-v2.1",
-        threshold=min(_ENTITY_THRESHOLDS.values()),
-    ))
-    engine.registry.add_recognizer(IndicNerRecognizer(
-        model_name="ai4bharat/IndicNER",
-        threshold=0.85 
-    ))
-    return engine
+_FINETUNED_PATH = "C:/College/PS-1/PII Masking/gliner_pii_finetuned"
 
-_analyzer   = _build_analyzer()
+_analyzer = AnalyzerEngine()
+_analyzer.registry.add_recognizer(GlinerRecognizer(finetuned_model_path=_FINETUNED_PATH))
 _anonymizer = AnonymizerEngine()
 
-_ENTITIES = ["PERSON", "ORGANIZATION", "ADDRESS", "LOCATION"]
+_ENTITIES = ["PERSON", "ORGANIZATION", "ADDRESS"]
 
 _OPERATORS = {
     "PERSON":       OperatorConfig("replace", {"new_value": "[NAME]"}),
     "ORGANIZATION": OperatorConfig("replace", {"new_value": "[ORG]"}),
     "ADDRESS":      OperatorConfig("replace", {"new_value": "[ADDRESS]"}),
-    "LOCATION":     OperatorConfig("replace", {"new_value": "[LOCATION]"}),
 }
-
-
-# =========================================================
-# UTILITIES
-# =========================================================
-
-class ResourceMonitor:
-    def __init__(self, label: str = "block", print_report: bool = True):
-        self.label = label
-        self.print_report = print_report
-        self._proc = psutil.Process(os.getpid())
-
-    def __enter__(self):
-        self._wall_start = time.perf_counter()
-        self._cpu_start  = self._proc.cpu_times()
-        self._mem_start  = self._proc.memory_info().rss
-        return self
-
-    def __exit__(self, *_):
-        wall_end = time.perf_counter()
-        cpu_end  = self._proc.cpu_times()
-        mem_cur  = self._proc.memory_info().rss
-        self.stats = {
-            "label":        self.label,
-            "wall_time_s":  round(wall_end - self._wall_start, 4),
-            "cpu_user_s":   round(cpu_end.user - self._cpu_start.user, 4),
-            "mem_delta_mb": round((mem_cur - self._mem_start) / 1024 / 1024, 2),
-        }
-        if self.print_report:
-            print(
-                f"\nExecution stats — {self.stats['label']}\n"
-                f"  Wall time : {self.stats['wall_time_s']:.4f} s\n"
-                f"  CPU user  : {self.stats['cpu_user_s']:.4f} s\n"
-                f"  RAM delta : {self.stats['mem_delta_mb']:+.2f} MB\n"
-            )
-
-def _repair_whitespace(text: str) -> str:
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    text = re.sub(r"(\w)\[", r"\1 [", text)
-    text = re.sub(r"]\s+([,.:;!?])", r"]\1", text)
-    return text.strip()
-
-
-# =========================================================
-# REGEX NAME PRE-PASS
-# =========================================================
-
-_NAME_DECLARATION_RE = re.compile(
-    r"""
-    (?:
-        \b(?:my\s+name\s+(?:is|:|was))\s+
-        ((?:[A-Z][a-zA-Z]*\.?\s*){1,6})
-    |
-        \bi\s+am\s+(?:mr\.?|mrs\.?|ms\.?|dr\.?|smt\.?|shri\.?)\s+
-        ((?:[A-Z][a-zA-Z]*\.?\s*){1,6})
-    |
-        \b(?:name\s*[:\-]\s*)
-        ((?:[A-Z][a-zA-Z]*\.?\s*){1,6})
-    |
-        (?:regards|sincerely|yours\s+(?:truly|faithfully|sincerely)|warm\s+regards)
-        \s*[,\n]\s*
-        ((?:[A-Z][a-zA-Z]*\.?\s*){1,4})
-    )
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-_REGEX_NAME_MIN_LEN = 3
-
-def _regex_name_hits(text: str) -> List[RecognizerResult]:
-    results = []
-    for m in _NAME_DECLARATION_RE.finditer(text):
-        for g in (1, 2, 3, 4):
-            span = m.group(g)
-            if not span:
-                continue
-            span = span.strip()
-            if len(span) < _REGEX_NAME_MIN_LEN:
-                continue
-            if _in_whitelist(span):
-                continue
-            if not _is_plausible_name(span):
-                continue
-            span_start = text.index(span, m.start())
-            span_end   = span_start + len(span)
-            results.append(RecognizerResult(
-                entity_type="PERSON",
-                start=span_start,
-                end=span_end,
-                score=0.95,
-            ))
-            break
-    return results
-
-
-# =========================================================
-# POST-OUTPUT CLEANUP
-# =========================================================
-
-_SPLIT_EMAIL_RE = re.compile(
-    r"\b[a-zA-Z][a-zA-Z0-9._%+\-]*\s*\[(?:PHONE|EMAIL)\]\s*"
-    r"(?:gmail|yahoo|hotmail|outlook|rediffmail|ymail|live|icloud)(?:\.com)?\b",
-    re.IGNORECASE,
-)
-
-def _fix_split_emails(text: str) -> str:
-    return _SPLIT_EMAIL_RE.sub("[EMAIL]", text)
 
 
 # =========================================================
 # PUBLIC API
 # =========================================================
 
-def mask_text_entities(text: str, monitor: bool = False) -> str:
-    with ResourceMonitor("mask_text_entities", print_report=monitor):
-        protected_text, restore_map = _regex_protect(text)
+def mask_text_entities(text: str) -> str:
+    # Step 1: Protect structured identifiers and known non-PII keywords
+    protected_text, restore_map = _protect_identifiers(text)
 
-        raw_hits = _analyzer.analyze(
-            text=protected_text,
-            language="en",
-            entities=_ENTITIES,
-        )
+    # Step 2: Run GLiNER via Presidio
+    hits = _analyzer.analyze(text=protected_text, language="en", entities=_ENTITIES)
+    redacted = _anonymizer.anonymize(
+        text=protected_text,
+        analyzer_results=hits,
+        operators=_OPERATORS,
+    )
 
-        regex_hits = _regex_name_hits(protected_text)
+    # Step 3: Restore protected originals
+    output = _restore_identifiers(redacted.text, restore_map)
 
-        all_hits = _dedup_results(list(raw_hits) + regex_hits)
-
-        redacted = _anonymizer.anonymize(
-            text=protected_text,
-            analyzer_results=all_hits,
-            operators=_OPERATORS,
-        )
-        output = redacted.text
-
-        for sentinel, original in restore_map.items():
-            output = output.replace(sentinel, original)
-
-        output = _fix_split_emails(output)
-        output = _repair_whitespace(output)
-
+    # Step 4: Clean up broken sentinel artefacts
+    output = _cleanup_artefacts(output)
     return output
+
+
+# =========================================================
+# TESTING & EXAMPLES
+# =========================================================
+
+if __name__ == "__main__":
+    print("Initializing PII Masker... (This may take a moment to load the models)")
+
+    test_cases = [
+        # Correct masking
+        "My name is Rahul Sharma and my contact number is +91-9876543210. Please email me at rahul.sharma@gmail.com.",
+        "The sole proprietor, Mr. Amit Kumar, applied for UDYAM registration. Udyam number: UDYAM-MH-18-0123456.",
+        "I am Dr. Sneha Desai. I live at Flat No 402, Sunshine Tower, MG Road, Bangalore.",
+        "Tata Consultancy Services is located in Pune. The Managing Director, Rajesh Gopinathan, signed the document.",
+        # False positive cases from real data
+        "DEAR SIR, I AM A PROPRIETOR HAVING PAN: GZDPD7433L AND AADHAR NUMBER: 9759 9062 6267.",
+        "I am running a Cement Business and want to get registered with MSME.",
+        "then I failed to enter OTP as my earlier mobile number has been changed.",
+        "Udyam Registration (UDYAM-WB-05-0001331) Certificate.",
+        "I want to update my phone number and email id in my UAM that is BR26D0018623.",
+        "When i am trying to do registration after Aadhar validation successful.",
+        "Application dt.06/06/2024 is still not converted in case.",
+        "UDHYOG AADHAAR MEMORANDUM HAS ALREADY BEEN DONE THROUGH THIS AADHAR NUMBER.",
+        "Udyog Aadhaar Number: MH18D0032045  Enterprise Name: P. O. P. Decorator  Date of Registration: 20/05/2018",
+    ]
+
+    print("\n" + "=" * 60)
+    print("RUNNING PII MASKING EXAMPLES")
+    print("=" * 60 + "\n")
+
+    for i, text in enumerate(test_cases, 1):
+        print(f"--- Example {i} ---")
+        print(f"ORIGINAL: {text}")
+        masked = mask_text_entities(text)
+        print(f"MASKED:   {masked}\n")
+
+    print("Testing complete.")
