@@ -36,6 +36,14 @@ LABEL_MAP = {
     "voter_id":        "voter_id",
     "drivers_license": "drivers_license",
     "card_number":     "card_number",
+    "org":             "company_name",
+    "pan":             "pan_card",
+    "phone":           "phone_number",
+    "email":           "email_address",
+    "udyam":           "udyam_number",
+    "udyog":           "udyog_number",
+    "address":         "postal_address",
+    "aadhaar":         "aadhaar_number"
 }
 
 ALL_LABELS = sorted(set(LABEL_MAP.values()))
@@ -127,11 +135,12 @@ def build_sample(query: str, masked: str) -> dict | None:
 
 def load_dataset(xlsx_path: str, max_rows: int | None = None) -> list[dict]:
     df = pd.read_excel(xlsx_path, nrows=max_rows)
-    df = df[["Query", "Masked"]].dropna(subset=["Query", "Masked"])
+    # Updated to match the new synthetic dataset columns
+    df = df[["Raw_Text", "Masked_Text"]].dropna(subset=["Raw_Text", "Masked_Text"])
 
     samples, skipped = [], 0
     for _, row in df.iterrows():
-        s = build_sample(str(row["Query"]), str(row["Masked"]))
+        s = build_sample(str(row["Raw_Text"]), str(row["Masked_Text"]))
         if s is not None:
             samples.append(s)
         else:
@@ -195,7 +204,7 @@ def split(samples, val_ratio=0.1, seed=42):
 # ── 7. Fine-tune ──────────────────────────────────────────────────────────────
 
 def train(
-    xlsx_path:   str        = "pii_dataset_3000.xlsx",
+    xlsx_path:   str        = "synthetic_pii_dataset.xlsx",
     base_model:  str        = "urchade/gliner_medium-v2.1",
     output_dir:  str        = "./gliner_pii_finetuned",
     num_epochs:  int        = 5,
@@ -293,7 +302,7 @@ if __name__ == "__main__":
     import argparse
 
     p = argparse.ArgumentParser(description="Fine-tune GLiNER on Indian PII data")
-    p.add_argument("--xlsx",        default="pii_dataset_v3.xlsx")
+    p.add_argument("--xlsx",        default="synthetic_pii_dataset.xlsx")
     p.add_argument("--base_model",  default="urchade/gliner_medium-v2.1")
     p.add_argument("--output_dir",  default="./gliner_pii_finetuned")
     p.add_argument("--epochs",      type=int,   default=5)

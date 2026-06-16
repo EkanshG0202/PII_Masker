@@ -12,25 +12,22 @@ Entities masked
   VOTER_ID       EPIC number  (3 letters + 7 digits)
   PASSPORT       Indian passport  (1 letter + 7 digits)
   DL             Driving licence  (SS-RR-YYYY-NNNNNNN)
-#   UDYAM          MSME Udyam registration  (UDYAM-XX-DD-NNNNNNN)
+  UDYAM          MSME Udyam registration  (UDYAM-XX-DD-NNNNNNN)
+  UDYOG          Udyog Aadhaar  (UAP19D0000001 / context-anchored 12-char)
+  UAM            Udyog Aadhaar Memorandum  (same format as UDYOG; context-anchored)
   UAN            EPFO Universal Account Number (context-anchored, 12 digits)
   EMAIL          E-mail addresses
 
-Ambiguous formats supported (NEW)
+Ambiguous formats supported
 ───────────────────────────────────────────────────────────
-  All entities now tolerate arbitrary separators (spaces, dashes, dots,
+  All entities tolerate arbitrary separators (spaces, dashes, dots,
   underscores, slashes) inserted between ANY characters, e.g.:
     E C P P G 0 1 1 1 K       ← space after every character
     E-C-P-P-G-0-1-1-1-K       ← dash after every character
     ECPP G0 111K               ← random groupings
-    [Aadhaar Redacted]         ← dashes instead of spaces in Aadhaar
-    98765 43210                ← phone split randomly
-    MH-27-2012-0034761         ← DL with extra dashes
-
-  A pre-processing step (_normalize_dense_separators) collapses
-  sequences where every character is followed by a separator — the
-  dominant "manual obfuscation" pattern — into compact tokens before
-  the main analysis runs.
+    U D Y A M - D L - 0 4 - 0 0 1 2 3 4 5   ← fully separated UDYAM
+    UAP 19D 000 0001           ← grouped Udyog Aadhaar
+    U-A-P-1-9-D-0-0-0-0-0-0-1 ← dash-separated UAM
 
 Setup
 ─────
@@ -73,25 +70,14 @@ def _norm(text: str) -> str:
 
 
 def _sep_pattern(strict: str) -> str:
-    """
-    Given a strict regex like r'[A-Z]{4}0[A-Z0-9]{6}', inject _S between
-    every atom so it tolerates arbitrary separators between characters.
-
-    Handles character classes [...], quantified groups {n}, and bare chars.
-    Each top-level atom is kept; _S is inserted between consecutive atoms.
-
-    This is a best-effort approach sufficient for fixed-length ID patterns.
-    For more complex patterns, recognizers build their own explicitly.
-    """
-    # Tokenise into atoms: [...], {n}, bare letter/digit/escaped, ^/$
     token_re = re.compile(
-        r'(\[\^?[^\]]*\]\{?\d*,?\d*\}?'   # [class]{n}
-        r'|\[\^?[^\]]*\]'                 # [class]
-        r'|\([^)]*\)\{?\d*,?\d*\}?'        # (group){n}
-        r'|\{?\d+,?\d*\}'                  # bare {n}
-        r'|\\.'                              # escaped char
-        r'|[^^$.|?*+(){}\\]'                # bare char (not meta)
-        r'|[.^$|?*+(){}\\]'                 # meta
+        r'(\[\^?[^\]]*\]\{?\d*,?\d*\}?'
+        r'|\[\^?[^\]]*\]'
+        r'|\([^)]*\)\{?\d*,?\d*\}?'
+        r'|\{?\d+,?\d*\}'
+        r'|\\.'
+        r'|[^^$.|?*+(){}\\]'
+        r'|[.^$|?*+(){}\\]'
         r')'
     )
     tokens = token_re.findall(strict)
@@ -109,23 +95,18 @@ def _normalize_dense_separators(text: str) -> str:
 
         "E C P P G 0 1 1 1 K"  →  "ECPPG0111K"
         "E-C-P-P-G-0-1-1-1-K"  →  "ECPPG0111K"
-        "2 3 4 5  6 7 8 9  0 1 2 3"  →  "2345678901 23"  (only tight runs)
+        "U D Y A M - D L - 0 4 - 0 0 1 2 3 4 5"  →  "UDYAM-DL-04-0012345"
 
     Algorithm:
       - Find maximal runs of (single-alnum)(single-separator) followed
         by a final alnum — at least 4 characters long.
       - Replace each run with its stripped version.
-      - Preserve surrounding context so span offsets remain consistent
-        for the result text (positions shift, but that is fine because
-        Presidio operates on the normalised copy).
     """
-    # Pattern: alnum, then (sep, alnum) repeated ≥3 times
-    # sep = exactly one non-alnum non-newline char (space, dash, dot, underscore…)
     dense = re.compile(
-        r'(?<![A-Za-z0-9])'        # not preceded by alnum (word boundary)
-        r'([A-Za-z0-9]'            # first char
-        r'(?:[^A-Za-z0-9\n][A-Za-z0-9]){3,})'  # (sep + alnum) × 3+
-        r'(?![A-Za-z0-9])'         # not followed by alnum
+        r'(?<![A-Za-z0-9])'
+        r'([A-Za-z0-9]'
+        r'(?:[^A-Za-z0-9\n][A-Za-z0-9]){3,})'
+        r'(?![A-Za-z0-9])'
     )
 
     def _strip(m):
@@ -135,7 +116,7 @@ def _normalize_dense_separators(text: str) -> str:
 
 
 # =========================================================
-# VALIDATORS  (unchanged — all use _norm internally)
+# VALIDATORS
 # =========================================================
 
 def _valid_aadhaar(text: str) -> bool:
@@ -188,11 +169,35 @@ def _valid_dl(text: str) -> bool:
     return bool(re.fullmatch(r'[A-Z]{2}\d{2}(19|20)\d{2}\d{7}', t))
 
 
-# def _valid_udyam(text: str) -> bool:
-#     return bool(re.fullmatch(
-#         r'UDYAM[A-Z]{2}\d{2}\d{7}',
-#         _norm(text).upper(),
-#     ))
+def _valid_udyam(text: str) -> bool:
+    """UDYAM-XX-DD-NNNNNNN: prefix UDYAM + 2-alpha state + 2-digit district + 7-digit serial."""
+    t = _norm(text).upper()
+    return bool(re.fullmatch(r'UDYAM[A-Z]{2}\d{2}\d{7}', t))
+
+
+# Indian state codes used in Udyog Aadhaar / UAM
+_UA_STATE_CODES = {
+    'AN','AP','AR','AS','BR','CG','CH','DD','DL','DN','GA','GJ','HP','HR',
+    'JH','JK','KA','KL','LA','LD','MH','ML','MN','MP','MZ','NL','OD','OR',
+    'PB','PY','RJ','SK','TG','TN','TR','TS','UP','UT','WB',
+}
+
+def _valid_udyog_uam(text: str) -> bool:
+    """
+    Udyog Aadhaar / UAM: UA + 2-char state code + 2-digit year + 1 alpha category
+    + 7-digit serial = 14 chars total.
+    Also accepts the compact 12-char variant (UA + state + 9 alphanum).
+    """
+    t = _norm(text).upper()
+    # Full 14-char format: UA + state(2) + year(2) + category(1) + serial(7)
+    m14 = re.fullmatch(r'UA([A-Z]{2})(\d{2})([A-Z])(\d{7})', t)
+    if m14:
+        return m14.group(1) in _UA_STATE_CODES
+    # Compact 12-char: UA + state(2) + 8 alphanum (some older formats)
+    m12 = re.fullmatch(r'UA([A-Z]{2})[A-Z0-9]{8}', t)
+    if m12:
+        return m12.group(1) in _UA_STATE_CODES
+    return False
 
 
 def _valid_uan(text: str) -> bool:
@@ -201,65 +206,35 @@ def _valid_uan(text: str) -> bool:
 
 
 # =========================================================
-# RECOGNIZERS
+# RECOGNIZERS (existing — unchanged)
 # =========================================================
 
 class CustomEmailRecognizer(PatternRecognizer):
-    """
-    Explicit email recognizer with strict fallbacks for typos and obfuscation.
-    Tightened to prevent false positives on regular English text.
-    """
     def __init__(self):
         super().__init__(
             supported_entity="EMAIL_ADDRESS",
             patterns=[
-                # 1. Standard well-formed email
-                Pattern(
-                    "email_standard", 
-                    r'(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b', 
-                    score=1.0
-                ),
-                
-                # 2. Missing '@' but attached directly to a known provider (e.g., ramesh1972gmail.com)
-                Pattern(
-                    "email_missing_at", 
-                    r'(?i)\b[A-Z0-9._%+-]+(?:gmail|yahoo|outlook|hotmail|rediffmail)\.com\b', 
-                    score=0.85
-                ),
-                
-                # 3. Explicit bracket obfuscation (e.g., user[at]domain[dot]com)
-                Pattern(
-                    "email_obfuscated_brackets", 
-                    r'(?i)\b[A-Z0-9._%+-]+\s*(?:\[at\]|\(at\))\s*[A-Z0-9.-]+\s*(?:\[dot\]|\(dot\)|\.)\s*(?:com|in|co\.in|org|net)\b', 
-                    score=0.80
-                ),
-
-                # 4. Spelled out words (e.g., user at gmail dot com)
-                Pattern(
-                    "email_obfuscated_words", 
-                    r'(?i)\b[A-Z0-9._%+-]+\s+at\s+(?:gmail|yahoo|outlook|hotmail|rediffmail)\s+(?:dot|\.)\s+(?:com|in|co\.in|org|net)\b', 
-                    score=0.80
-                ),
-                
-                # 5. Missing '@' replaced by a space (e.g., jayjagannath5press gmail.com)
-                # {3,} requires the username to be 3+ chars to avoid masking "to gmail.com"
-                Pattern(
-                    "email_space_missing_at",
-                    r'(?i)\b[A-Z0-9._%+-]{3,}\s+(?:gmail|yahoo|outlook|hotmail|rediffmail)\.com\b',
-                    score=0.80
-                )
+                Pattern("email_standard",
+                        r'(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b',
+                        score=1.0),
+                Pattern("email_missing_at",
+                        r'(?i)\b[A-Z0-9._%+-]+(?:gmail|yahoo|outlook|hotmail|rediffmail)\.com\b',
+                        score=0.85),
+                Pattern("email_obfuscated_brackets",
+                        r'(?i)\b[A-Z0-9._%+-]+\s*(?:\[at\]|\(at\))\s*[A-Z0-9.-]+\s*(?:\[dot\]|\(dot\)|\.)\s*(?:com|in|co\.in|org|net)\b',
+                        score=0.80),
+                Pattern("email_obfuscated_words",
+                        r'(?i)\b[A-Z0-9._%+-]+\s+at\s+(?:gmail|yahoo|outlook|hotmail|rediffmail)\s+(?:dot|\.)\s+(?:com|in|co\.in|org|net)\b',
+                        score=0.80),
+                Pattern("email_space_missing_at",
+                        r'(?i)\b[A-Z0-9._%+-]{3,}\s+(?:gmail|yahoo|outlook|hotmail|rediffmail)\.com\b',
+                        score=0.80),
             ],
         )
 
+
 class AadhaarRecognizer(PatternRecognizer):
-    """
-    Matches Aadhaar in all separator variants:
-      • 4-4-4 with standard separators  (original)
-      • 4-4-4 with arbitrary separators per group
-      • Every digit separated individually: [Aadhaar Redacted]
-      • Mixed: [Aadhaar Redacted]
-    """
-    _G4  = r'\d' + _S + r'\d' + _S + r'\d' + _S + r'\d'   # 4 digits with seps
+    _G4  = r'\d' + _S + r'\d' + _S + r'\d' + _S + r'\d'
     _SEP = r'[\s.\-_()/]{0,3}'
 
     def __init__(self):
@@ -268,15 +243,12 @@ class AadhaarRecognizer(PatternRecognizer):
         super().__init__(
             supported_entity="AADHAAR",
             patterns=[
-                # Original: 4-4-4 grouped
                 Pattern("aadhaar_4_4_4",
                         r'(?<!\d)\d{4}' + sep + r'\d{4}' + sep + r'\d{4}(?!\d)',
                         score=0.85),
-                # Fully separated: every digit has a separator
                 Pattern("aadhaar_separated",
                         r'(?<![A-Za-z0-9])' + g4 + sep + g4 + sep + g4 + r'(?![A-Za-z0-9])',
                         score=0.80),
-                # Bare 12 digits (context-anchored)
                 Pattern("aadhaar_12_bare",
                         r'(?<!\d)\d{12}(?!\d)',
                         score=0.55),
@@ -289,14 +261,6 @@ class AadhaarRecognizer(PatternRecognizer):
 
 
 class PANRecognizer(PatternRecognizer):
-    """
-    PAN card: AAAAA9999A
-    Tolerates any separator between every character.
-    Examples:
-      ECPPG0111K  /  E C P P G 0 1 1 1 K  /  E-C-P-P-G-0-1-1-1-K
-      ECPP-G01-11K  /  E.C.P.P.G.0.1.1.1.K
-    """
-    # 5 alpha, 4 digit, 1 alpha — each char separated by _S
     _ALPHA = r'[A-Za-z]'
     _DIGIT = r'[0-9]'
 
@@ -304,11 +268,11 @@ class PANRecognizer(PatternRecognizer):
         a, d, s = self._ALPHA, self._DIGIT, _S
         pan_sep = (
             r'(?<![A-Za-z0-9])'
-            + a + s + a + s + a + s + a + s + a  # 5 alpha
+            + a + s + a + s + a + s + a + s + a
             + s
-            + d + s + d + s + d + s + d           # 4 digit
+            + d + s + d + s + d + s + d
             + s
-            + a                                    # 1 alpha
+            + a
             + r'(?![A-Za-z0-9])'
         )
         super().__init__(
@@ -328,32 +292,20 @@ class PANRecognizer(PatternRecognizer):
 
 
 class GSTRecognizer(PatternRecognizer):
-    """
-    GSTIN: 2-digit state + PAN(10) + 1 + Z + 1 = 15 chars
-    Tolerates separators between every character.
-    """
     _D = r'[0-9]'
     _A = r'[A-Za-z]'
     _AN = r'[A-Za-z0-9]'
 
     def __init__(self):
         d, a, an, s = self._D, self._A, self._AN, _S
-
         gst_sep = (
             r'(?<![A-Za-z0-9])'
-            # 2-digit state code
             + d + s + d + s
-            # 5 alpha (PAN part)
             + a + s + a + s + a + s + a + s + a + s
-            # 4 digit
             + d + s + d + s + d + s + d + s
-            # 1 alpha
             + a + s
-            # 1 alphanumeric (1-9 or A-Z)
             + an + s
-            # literal Z
             + r'[Zz]' + s
-            # 1 alphanumeric checksum
             + an
             + r'(?![A-Za-z0-9])'
         )
@@ -374,12 +326,6 @@ class GSTRecognizer(PatternRecognizer):
 
 
 class IFSCRecognizer(PatternRecognizer):
-    """
-    IFSC: 4 alpha + 0 + 6 alphanumeric
-    Tolerates separators between every character.
-    Examples:
-      HDFC0001234  /  H D F C 0 0 0 1 2 3 4  /  HDFC-0-001234
-    """
     _A = r'[A-Za-z]'
     _AN = r'[A-Za-z0-9]'
 
@@ -387,9 +333,9 @@ class IFSCRecognizer(PatternRecognizer):
         a, an, s = self._A, self._AN, _S
         ifsc_sep = (
             r'(?<![A-Za-z0-9])'
-            + a + s + a + s + a + s + a   # 4 alpha
-            + s + r'0' + s                # literal 0
-            + an + s + an + s + an + s + an + s + an + s + an  # 6 alphanum
+            + a + s + a + s + a + s + a
+            + s + r'0' + s
+            + an + s + an + s + an + s + an + s + an + s + an
             + r'(?![A-Za-z0-9])'
         )
         super().__init__(
@@ -409,18 +355,12 @@ class IFSCRecognizer(PatternRecognizer):
 
 
 class IndianPhoneRecognizer(PatternRecognizer):
-    """
-    All common Indian mobile formats + fully separated digit runs.
-    Examples:
-      9876543210  /  98765 43210  /  9 8 7 6 5 4 3 2 1 0
-      +91-98765-43210  /  +91 9 8 7 6 5 4 3 2 1 0
-    """
     _CC  = r'(?:(?:\+|0{0,2})91[\s()\-]*)?'
-    _S10 = (                                                 # 10 digits, any sep
+    _S10 = (
         r'[6-9]' + _S
-        + r'\d' + _S + r'\d' + _S + r'\d' + _S + r'\d'   # 5 digits
+        + r'\d' + _S + r'\d' + _S + r'\d' + _S + r'\d'
         + _S
-        + r'\d' + _S + r'\d' + _S + r'\d' + _S + r'\d' + _S + r'\d'  # 5 digits
+        + r'\d' + _S + r'\d' + _S + r'\d' + _S + r'\d' + _S + r'\d'
     )
     _P1  = r'(?<!\d)' + _CC + r'[6-9]\d{4}[\s\-.]?\d{5}(?!\d)'
     _P2  = r'(?:(?:\+|0{0,2})91[\s]*)\(\d{3}\)[\s\-]*\d{3}[\s\-]*\d{4}'
@@ -435,7 +375,6 @@ class IndianPhoneRecognizer(PatternRecognizer):
                 Pattern("phone_p2", self._P2, score=0.85),
                 Pattern("phone_p3", self._P3, score=0.80),
                 Pattern("phone_p4", self._P4, score=0.75),
-                # Fully separated 10-digit run (with optional country code)
                 Pattern("phone_sep10",
                         r'(?<![A-Za-z0-9])' + self._CC + self._S10 + r'(?![A-Za-z0-9])',
                         score=0.78),
@@ -447,12 +386,6 @@ class IndianPhoneRecognizer(PatternRecognizer):
 
 
 class VoterIdRecognizer(PatternRecognizer):
-    """
-    EPIC: 3 uppercase letters + 7 digits
-    Tolerates separators between every character.
-    Examples:
-      XGN3002623  /  X G N 3 0 0 2 6 2 3  /  XGN-3002623  /  X-G-N-3-0-0-2-6-2-3
-    """
     _A = r'[A-Za-z]'
     _D = r'[0-9]'
 
@@ -460,9 +393,9 @@ class VoterIdRecognizer(PatternRecognizer):
         a, d, s = self._A, self._D, _S
         voter_sep = (
             r'(?<![A-Za-z0-9])'
-            + a + s + a + s + a   # 3 alpha
+            + a + s + a + s + a
             + s
-            + d + s + d + s + d + s + d + s + d + s + d + s + d  # 7 digits
+            + d + s + d + s + d + s + d + s + d + s + d + s + d
             + r'(?![A-Za-z0-9])'
         )
         super().__init__(
@@ -482,23 +415,17 @@ class VoterIdRecognizer(PatternRecognizer):
 
 
 class PassportRecognizer(PatternRecognizer):
-    """
-    Indian passport: 1 letter + 7 digits (first & last digit non-zero)
-    Tolerates separators between every character.
-    Examples:
-      A2345671  /  A 2 3 4 5 6 7 1  /  A-2345671  /  A-2-3-4-5-6-7-1
-    """
     _A = r'[A-Za-z]'
-    _NZ = r'[1-9]'   # non-zero digit
+    _NZ = r'[1-9]'
     _D  = r'[0-9]'
 
     def __init__(self):
         a, nz, d, s = self._A, self._NZ, self._D, _S
         pp_sep = (
             r'(?<![A-Za-z0-9])'
-            + a + s + nz + s          # letter + non-zero
-            + d + s + d + s + d + s + d + s + d  # 5 middle digits
-            + s + nz                   # non-zero last
+            + a + s + nz + s
+            + d + s + d + s + d + s + d + s + d
+            + s + nz
             + r'(?![A-Za-z0-9])'
         )
         super().__init__(
@@ -518,13 +445,6 @@ class PassportRecognizer(PatternRecognizer):
 
 
 class DrivingLicenceRecognizer(PatternRecognizer):
-    """
-    Indian DL: SS-RR-YYYY-NNNNNNN (2+2+4+7 = 15 chars)
-    Original pattern already tolerates some separators; now also matches
-    fully character-separated variants.
-    Examples:
-      MH272012 0034761  /  MH-27-2012-0034761  /  M H 2 7 2 0 1 2 0 0 3 4 7 6 1
-    """
     _DL_STRICT = (
         r'(?<![A-Z0-9])'
         r'[A-Z]{2}[\s\-]?\d{2}[\s\-]?(19|20)\d{2}[\s\-]?\d{7}'
@@ -537,13 +457,13 @@ class DrivingLicenceRecognizer(PatternRecognizer):
         a, d, s = self._A, self._D, _S
         dl_sep = (
             r'(?<![A-Za-z0-9])'
-            + a + s + a                                       # 2-char state
+            + a + s + a
             + s
-            + d + s + d                                       # 2-digit RTO
+            + d + s + d
             + s
-            + r'(?:19|20)' + s + d + s + d           # year
+            + r'(?:19|20)' + s + d + s + d
             + s
-            + d + s + d + s + d + s + d + s + d + s + d + s + d  # 7-digit serial
+            + d + s + d + s + d + s + d + s + d + s + d + s + d
             + r'(?![A-Za-z0-9])'
         )
         super().__init__(
@@ -558,58 +478,211 @@ class DrivingLicenceRecognizer(PatternRecognizer):
         return _valid_dl(pattern_text)
 
 
-# class UdyamRecognizer(PatternRecognizer):
-#     """
-#     UDYAM-XX-DD-NNNNNNN
-#     The UDYAM prefix is distinctive; also tolerates separators within each segment.
-#     Examples:
-#       UDYAM-DL-04-0012345  /  U D Y A M - D L - 0 4 - 0 0 1 2 3 4 5
-#     """
-#     def __init__(self):
-#         s = _S
-#         udyam_sep = (
-#             r'(?i)(?<!\w)'
-#             r'U' + s + r'D' + s + r'Y' + s + r'A' + s + r'M'
-#             + s + r'[\-]?' + s
-#             + r'[A-Za-z]' + s + r'[A-Za-z]'
-#             + s + r'[\-]?' + s
-#             + r'[0-9]' + s + r'[0-9]'
-#             + s + r'[\-]?' + s
-#             + r'[0-9]' + s + r'[0-9]' + s + r'[0-9]' + s
-#             + r'[0-9]' + s + r'[0-9]' + s + r'[0-9]' + s + r'[0-9]'
-#             + r'(?!\w)'
-#         )
-#         super().__init__(
-#             supported_entity="UDYAM",
-#             patterns=[
-#                 Pattern("udyam_strict",
-#                         r'(?i)(?<!\w)UDYAM[\-][A-Z]{2}[\-]\d{2}[\-]\d{7}(?!\w)',
-#                         score=0.99),
-#                 Pattern("udyam_separated",
-#                         udyam_sep,
-#                         score=0.92),
-#             ],
-#         )
+# =========================================================
+# NEW — UDYAM RECOGNIZER
+# Format: UDYAM-XX-DD-NNNNNNN
+#   UDYAM  : literal prefix (5 chars)
+#   XX     : 2-char state code (alpha)
+#   DD     : 2-digit district number
+#   NNNNNNN: 7-digit serial
+# Total stripped: 5+2+2+7 = 16 alphanum chars
 #
-#     def validate_result(self, pattern_text):
-#         return _valid_udyam(pattern_text)
+# Handles:
+#   • Standard:      UDYAM-DL-04-0012345
+#   • No dashes:     UDYAMDL040012345
+#   • Space-sep:     U D Y A M D L 0 4 0 0 1 2 3 4 5
+#   • Dash-sep:      U-D-Y-A-M-D-L-0-4-0-0-1-2-3-4-5
+#   • Mixed/grouped: UDYAM DL 04 0012345 / UDYAM-DL 04-0012345
+#   • Case-insensitive
+# =========================================================
+
+class UdyamRecognizer(PatternRecognizer):
+    """
+    MSME Udyam Registration Number: UDYAM-XX-DD-NNNNNNN
+    Tolerates:
+      - Any separator (space, dash, dot, underscore) between segments OR between every char
+      - Case-insensitive
+      - Bare (no separator), grouped, or fully separated
+    """
+    _A = r'[A-Za-z]'
+    _D = r'[0-9]'
+
+    def __init__(self):
+        a, d, s = self._A, self._D, _S
+
+        # Strict: UDYAM (with optional single separator between segments) - XX - DD - NNNNNNN
+        # Allows separator between each segment block
+        udyam_strict = (
+            r'(?i)(?<!\w)'
+            r'UDYAM'
+            + r'[\s.\-_]{0,3}'   # sep after UDYAM
+            + r'[A-Z]{2}'        # state code
+            + r'[\s.\-_]{0,3}'   # sep
+            + r'\d{2}'           # district
+            + r'[\s.\-_]{0,3}'   # sep
+            + r'\d{7}'           # serial
+            + r'(?!\w)'
+        )
+
+        # Fully character-separated: U-D-Y-A-M-D-L-0-4-0-0-1-2-3-4-5
+        # Each char of UDYAM followed by _S, then state (2), district (2), serial (7)
+        udyam_sep = (
+            r'(?i)(?<![A-Za-z0-9])'
+            # U D Y A M  (each letter + optional sep)
+            + r'[Uu]' + s + r'[Dd]' + s + r'[Yy]' + s + r'[Aa]' + s + r'[Mm]'
+            + s
+            # state code: 2 alpha
+            + a + s + a
+            + s
+            # district: 2 digits
+            + d + s + d
+            + s
+            # serial: 7 digits
+            + d + s + d + s + d + s + d + s + d + s + d + s + d
+            + r'(?![A-Za-z0-9])'
+        )
+
+        super().__init__(
+            supported_entity="UDYAM",
+            patterns=[
+                Pattern("udyam_strict",    udyam_strict, score=0.99),
+                Pattern("udyam_separated", udyam_sep,    score=0.92),
+            ],
+            context=["udyam", "msme", "registration", "udyam certificate",
+                     "msme registration", "udyam number"],
+        )
+
+    def validate_result(self, pattern_text: str) -> bool:
+        return _valid_udyam(pattern_text)
 
 
 # =========================================================
-# CONTEXT-ANCHORED RECOGNIZERS (unchanged logic, but digit
-# patterns now also tolerate separators within digit spans)
+# NEW — UDYOG / UAM RECOGNIZER
+# Udyog Aadhaar (UA) and Udyog Aadhaar Memorandum share the same format:
+#   UA + 2-char state code + 2-digit year + 1-char category + 7-digit serial
+#   Example: UAP19D0000001  (UA + AP + 19 + D + 0000001)
+#            UADL04A0034567
+#
+# Also accepts compact 12-char: UA + state(2) + 8 alphanum (older issuances)
+#
+# Context-anchored when the number alone is ambiguous; standalone UA* matched
+# at high confidence when state code is valid.
+#
+# Handles:
+#   • Standard:      UAP19D0000001
+#   • Space-sep:     U A P 1 9 D 0 0 0 0 0 0 1
+#   • Dash-sep:      U-A-P-1-9-D-0-0-0-0-0-0-1
+#   • Grouped:       UA-P19-D000-0001 / UAP 19D 0000001
+#   • Context-form:  Udyog Aadhaar: UAP19D0000001
+#   • UAM prefix:    UAM No: UAP19D0000001  (keyword disambiguates)
+# =========================================================
+
+class UdyogUAMRecognizer(PatternRecognizer):
+    """
+    Udyog Aadhaar / UAM number — all three forms, separated variants included.
+    """
+    _A  = r'[A-Za-z]'
+    _AN = r'[A-Za-z0-9]'
+    _D  = r'[0-9]'
+
+    _STATE_ALT = '|'.join(sorted(_UA_STATE_CODES, key=len, reverse=True))
+
+    def __init__(self):
+        a, an, d, s = self._A, self._AN, self._D, _S
+
+        # ── Form B: UA + valid-state + YY + alpha-cat + 7-digit serial (14 chars) ──
+        udyog_strict14 = (
+            r'(?i)(?<![A-Za-z0-9])'
+            r'UA'
+            + r'(?:' + self._STATE_ALT + r')'
+            + r'\d{2}'
+            + r'[A-Z]'
+            + r'\d{7}'
+            + r'(?![A-Za-z0-9])'
+        )
+
+        # ── Form C: UA + valid-state + 8 alphanum compact (12 chars) ──
+        udyog_strict12 = (
+            r'(?i)(?<![A-Za-z0-9])'
+            r'UA'
+            + r'(?:' + self._STATE_ALT + r')'
+            + r'[A-Z0-9]{8}'
+            + r'(?![A-Za-z0-9])'
+        )
+
+        # ── Form B separated: U A <state> <yy> <cat> <7d> ──
+        udyog_sep14 = (
+            r'(?i)(?<![A-Za-z0-9])'
+            + r'[Uu]' + s + r'[Aa]'
+            + s + a + s + a          # state
+            + s + d + s + d          # year
+            + s + a                  # category
+            + s + d + s + d + s + d + s + d + s + d + s + d + s + d  # 7 digits
+            + r'(?![A-Za-z0-9])'
+        )
+
+        # ── Form C separated: U A <state> <8 alphanum> ──
+        udyog_sep12 = (
+            r'(?i)(?<![A-Za-z0-9])'
+            + r'[Uu]' + s + r'[Aa]'
+            + s + a + s + a
+            + s + an + s + an + s + an + s + an + s + an + s + an + s + an + s + an
+            + r'(?![A-Za-z0-9])'
+        )
+
+        # ── Form A (no UA prefix): SS YY X NNNNNNN ──
+        # Strict 12-char: state(2) + year(2) + category(1 alpha) + serial(7 digits)
+        # Valid state codes make the alternation selective enough for standalone use.
+        udyog_noua_bare = (
+            r'(?<![A-Za-z0-9])'
+            + r'(?:' + self._STATE_ALT + r')'   # valid 2-char state
+            + r'\d{2}'                           # 2-digit year
+            + r'[A-Za-z]'                        # category letter
+            + r'\d{7}'                           # 7-digit serial
+            + r'(?![A-Za-z0-9])'
+        )
+
+        # Separated Form A: each char optionally separated
+        udyog_noua_sep = (
+            r'(?<![A-Za-z0-9])'
+            + a + s + a              # state (2 alpha)
+            + s + d + s + d          # year (2 digits)
+            + s + a                  # category (1 alpha)
+            + s + d + s + d + s + d + s + d + s + d + s + d + s + d  # 7 digits
+            + r'(?![A-Za-z0-9])'
+        )
+
+        super().__init__(
+            supported_entity="UDYOG_UAM",
+            patterns=[
+                # UA-prefix variants — high confidence standalone
+                Pattern("udyog_strict14",    udyog_strict14, score=0.97),
+                Pattern("udyog_strict12",    udyog_strict12, score=0.93),
+                Pattern("udyog_sep14",       udyog_sep14,    score=0.90),
+                Pattern("udyog_sep12",       udyog_sep12,    score=0.86),
+                # No-UA-prefix variants — validator enforces state+year constraints
+                Pattern("udyog_noua_bare",   udyog_noua_bare, score=0.88),
+                Pattern("udyog_noua_sep",    udyog_noua_sep,  score=0.82),
+            ],
+            context=[
+                "udyog", "udyog aadhaar", "uam", "udyog aadhaar memorandum",
+                "ua number", "msme", "udyam", "ssme", "small enterprise",
+                "micro enterprise", "medium enterprise",
+                "uam no", "uam number", "uan number",
+                "registration", "certificate",
+            ],
+        )
+
+    def validate_result(self, pattern_text: str) -> bool:
+        return _valid_udyog_uam(pattern_text)
+
+
+# =========================================================
+# CONTEXT-ANCHORED RECOGNIZERS (unchanged)
 # =========================================================
 
 class AccountNumberRecognizer(EntityRecognizer):
-    """
-    Indian bank account numbers, 11–18 digits.
-    Also matches digits written with spaces/dashes between them
-    when preceded by an account-number keyword.
-    Only the digit span is masked.
-    """
-    # Digit string with optional single separators between digits (11–18 digits)
     _DIG_SEP = r'\d(?:[\s.\-_]?\d){10,17}'
-
     _FULL = re.compile(
         r'(?i)(?:'
             r'account\s*(?:no\.?|number|#)?'
@@ -645,13 +718,7 @@ class AccountNumberRecognizer(EntityRecognizer):
 
 
 class UANRecognizer(EntityRecognizer):
-    """
-    EPFO Universal Account Number — 12 digits.
-    Also matches digits with separators when preceded by a UAN keyword.
-    Only the digit span is masked.
-    """
     _DIG_SEP = r'\d(?:[\s.\-_]?\d){11}'
-
     _FULL = re.compile(
         r'(?i)(?:'
             r'uan'
@@ -691,7 +758,6 @@ class UANRecognizer(EntityRecognizer):
 # =========================================================
 
 def _resolve_overlaps(results: list) -> list:
-    """Keep the best (highest score, then longest span) non-overlapping results."""
     sorted_r = sorted(results, key=lambda r: (r.score, r.end - r.start), reverse=True)
     kept: list[RecognizerResult] = []
     for candidate in sorted_r:
@@ -749,7 +815,8 @@ def _build_analyzer() -> AnalyzerEngine:
         VoterIdRecognizer,
         PassportRecognizer,
         DrivingLicenceRecognizer,
-        # UdyamRecognizer,
+        UdyamRecognizer,
+        UdyogUAMRecognizer,
         UANRecognizer,
     ):
         engine.registry.add_recognizer(cls())
@@ -765,7 +832,7 @@ _ENTITIES = [
     "AADHAAR", "PAN", "GST", "IFSC",
     "PHONE", "ACCOUNT_NUMBER",
     "VOTER_ID", "PASSPORT", "DL",
-    # "UDYAM",
+    "UDYAM", "UDYOG_UAM",
     "UAN",
 ]
 
@@ -780,7 +847,8 @@ _OPERATORS = {
     "VOTER_ID":       OperatorConfig("replace", {"new_value": "[VOTER_ID]"}),
     "PASSPORT":       OperatorConfig("replace", {"new_value": "[PASSPORT]"}),
     "DL":             OperatorConfig("replace", {"new_value": "[DL]"}),
-    # "UDYAM":          OperatorConfig("replace", {"new_value": "[UDYAM]"}),
+    "UDYAM":          OperatorConfig("replace", {"new_value": "[UDYAM]"}),
+    "UDYOG_UAM":      OperatorConfig("replace", {"new_value": "[UDYOG_UAM]"}),
     "UAN":            OperatorConfig("replace", {"new_value": "[UAN]"}),
 }
 
@@ -790,11 +858,6 @@ _OPERATORS = {
 # =========================================================
 
 class ResourceMonitor:
-    """
-    Context manager that measures CPU time, wall time, memory delta,
-    peak memory, and thread count for any block of code.
-    """
-
     def __init__(self, label: str = "block", print_report: bool = True):
         self.label        = label
         self.print_report = print_report
@@ -821,13 +884,13 @@ class ResourceMonitor:
         threads       = self._proc.num_threads()
 
         self.stats = {
-            "label":            self.label,
-            "wall_time_s":      round(wall_elapsed,  4),
-            "cpu_user_s":       round(cpu_user,      4),
-            "cpu_sys_s":        round(cpu_sys,       4),
-            "mem_rss_mb":       round(mem_current  / 1024 / 1024, 2),
-            "mem_delta_mb":     round(mem_delta     / 1024 / 1024, 2),
-            "threads":          threads,
+            "label":        self.label,
+            "wall_time_s":  round(wall_elapsed,  4),
+            "cpu_user_s":   round(cpu_user,      4),
+            "cpu_sys_s":    round(cpu_sys,       4),
+            "mem_rss_mb":   round(mem_current  / 1024 / 1024, 2),
+            "mem_delta_mb": round(mem_delta     / 1024 / 1024, 2),
+            "threads":      threads,
         }
 
         if self.print_report:
@@ -859,15 +922,10 @@ def mask_pii(text: str, monitor: bool = False) -> str:
 
     Pipeline:
       1. _normalize_dense_separators  — collapse "char-sep-char-sep" runs
-         so the main recognizers see compact tokens.
-      2. Presidio analyze on the (possibly normalized) text.
+      2. Presidio analyze on the normalised text.
       3. Overlap resolution.
       4. Presidio anonymize.
       5. Whitespace repair.
-
-    Args:
-        text:    Input string to mask.
-        monitor: If True, prints a resource-usage report after each call.
     """
     with ResourceMonitor("mask_pii", print_report=monitor) as _mon:
         normalised = _normalize_dense_separators(text)
@@ -890,15 +948,16 @@ if __name__ == "__main__":
 
     tests = [
 
+        # ── EXISTING TESTS (unchanged) ─────────────────────────────────
+
         ("TEST 1 — Original bare values (no label)", """
         ECPPG0111K
         29ABCDE1234F1Z5
         HDFC0001234
-        [Aadhaar Redacted]
+        2389 4539 1048
         XGN3002623
         A2345671
         MH27 2012 0034761
-        # UDYAM-DL-04-0012345
         9876543210
         user@example.com
         """),
@@ -907,11 +966,10 @@ if __name__ == "__main__":
         PAN no: ECPPG0111K
         GSTIN: 29ABCDE1234F1Z5
         IFSC HDFC0001234
-        Aadhaar: [Aadhaar Redacted]
+        Aadhaar: 2389 4539 1048
         Voter ID XGN3002623
         Passport A2345671
         DL MH27 2012 0034761
-        # UDYAM-DL-04-0012345
         Mobile: 9876543210
         Email: user@example.com
         """),
@@ -924,10 +982,8 @@ if __name__ == "__main__":
         """),
 
         ("TEST 4 — Mixed prose", """
-        Hi, my Aadhaar is [Aadhaar Redacted] and my phone is 9 8 7 6 5 4 3 2 1 0.
+        Hi, my Aadhaar is 2389 4539 1048 and my phone is 9 8 7 6 5 4 3 2 1 0.
         """),
-
-        # ── NEW AMBIGUOUS-FORMAT TESTS ──────────────────────────────────
 
         ("TEST 5 — Space after every character", """
         PAN:  E C P P G 0 1 1 1 K
@@ -940,16 +996,15 @@ if __name__ == "__main__":
         PAN:  E-C-P-P-G-0-1-1-1-K
         GSTIN: 2-9-A-B-C-D-E-1-2-3-4-F-1-Z-5
         IFSC: H-D-F-C-0-0-0-1-2-3-4
-        Aadhaar: [Aadhaar Redacted]
+        Aadhaar: 2-3-8-9-4-5-3-9-1-0-4-8
         Phone: 9-8-7-6-5-4-3-2-1-0
         """),
 
         ("TEST 7 — Random groupings / mixed separators", """
         PAN: ECPP G0 111K
         IFSC: HD FC00 01234
-        Aadhaar: [Aadhaar Redacted]
+        Aadhaar: 2389 4539 1048
         DL: MH-27 2012-003 4761
-        # UDYAM: UDYAM DL 04 0012345
         account no: 5 5 6 7 8 9 0 1 2 3 4 5 6 7
         UAN: 1 0 0 2 3 4 5 6 7 8 9 0
         """),
@@ -961,8 +1016,81 @@ if __name__ == "__main__":
         Voter ID: X.G.N.3.0.0.2.6.2.3
         """),
 
-        ("TEST 9 — In flowing prose with ambiguous IDs", """
-        Respected Madam, I 2389 4539 1048 aged 145, Saket, Mumbai, Jharkhand, 862994 years residing at NEW PRESS Industries have lost my Udyam certificate. My registration number is OR-93-JB-1456 Aadhaar 132, Park Street, Ward 5, Nashik, Uttar Pradesh, 788787 PAN CWZ2786687. I need a duplicate certificate for bank loan application. My phone is Nikhil Joshi and email is 8880375323.
+        # ── NEW UDYAM / UDYOG / UAM TESTS ─────────────────────────────
+
+        ("TEST 9 — UDYAM standard formats", """
+        Registration: UDYAM-DL-04-0012345
+        My MSME number is UDYAM-MH-27-0098765
+        udyam-ka-05-0001234
+        UDYAM-UP-09-0034567
+        """),
+
+        ("TEST 10 — UDYAM bare (no dashes)", """
+        UDYAMDL040012345
+        UDYAMMH270098765
+        """),
+
+        ("TEST 11 — UDYAM space-separated (every character)", """
+        U D Y A M D L 0 4 0 0 1 2 3 4 5
+        U D Y A M M H 2 7 0 0 9 8 7 6 5
+        """),
+
+        ("TEST 12 — UDYAM dash-separated (every character)", """
+        U-D-Y-A-M-D-L-0-4-0-0-1-2-3-4-5
+        u-d-y-a-m-m-h-2-7-0-0-9-8-7-6-5
+        """),
+
+        ("TEST 13 — UDYAM random groupings / mixed separators", """
+        UDYAM DL 04 0012345
+        UDYAM-DL 04-0012345
+        UDYAM.DL.04.0012345
+        UDYAM_DL_04_0012345
+        UDYAM/DL/04/0012345
+        """),
+
+        ("TEST 14 — UDYOG Aadhaar standard (14-char)", """
+        Udyog Aadhaar: UAP19D0000001
+        UA Number: UADL04A0034567
+        UAMH27B0098765
+        UAUP09C0001234
+        """),
+
+        ("TEST 15 — UDYOG compact legacy (12-char)", """
+        Udyog Aadhaar: UAAP00000001
+        UAM No: UADL00034567
+        """),
+
+        ("TEST 16 — UDYOG / UAM space-separated (every character)", """
+        Udyog Aadhaar: U A P 1 9 D 0 0 0 0 0 0 1
+        UAM: U A D L 0 4 A 0 0 3 4 5 6 7
+        """),
+
+        ("TEST 17 — UDYOG / UAM dash-separated (every character)", """
+        U-A-P-1-9-D-0-0-0-0-0-0-1
+        U-A-D-L-0-4-A-0-0-3-4-5-6-7
+        """),
+
+        ("TEST 18 — UDYOG / UAM mixed groupings", """
+        UAP 19D 0000001
+        UA-P19-D000-0001
+        UA.DL.04A.0034567
+        UA_MH_27B_0098765
+        """),
+
+        ("TEST 19 — All three in flowing prose", """
+        Dear Sir, I am writing regarding my MSME enterprises.
+        My Udyam registration is UDYAM-DL-04-0012345 and my Udyog Aadhaar
+        number is UAP19D0000001. I also have an older UAM number UADL00034567.
+        My PAN is ECPPG0111K and mobile is 9876543210.
+        Please contact me at owner@mybusiness.in for any queries.
+        """),
+
+        ("TEST 20 — Obfuscated mix of all three", """
+        Udyam: U-D-Y-A-M-D-L-0-4-0-0-1-2-3-4-5
+        Udyog: U A P 1 9 D 0 0 0 0 0 0 1
+        UAM: UA.DL.04A.0034567
+        PAN: E C P P G 0 1 1 1 K
+        Phone: 9-8-7-6-5-4-3-2-1-0
         """),
 
     ]

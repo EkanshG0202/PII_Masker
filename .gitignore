@@ -8,3 +8,20 @@ __pycache__/
 
 masked_output.csv
 masked_output.txt
+
+
+
+# Excel datasets
+pii_dataset_3000.xlsx
+pii_dataset_v3.xlsx
+pii_masking_analysis.xlsx
+
+# Training data
+english_queries.txt
+extracted_queries.txt
+gliner_train_data.json
+
+# Jupyter checkpoints (optional)
+.ipynb_checkpoints/
+
+test.py
